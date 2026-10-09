@@ -166,7 +166,58 @@ contains
             'POST: t:', time%t, ' Ekin:', e1, ' enst:', e2
     end if
 
+    call omega_variance(time)
+
   end subroutine user_calc_quantities
+
+  ! Compute and print the variance of the vorticity magnitude over the domain.
+  ! Variance is defined as <|omega|^2> - |<omega>|^2.
+  subroutine omega_variance(time)
+    type(time_state_t), intent(in) :: time
+
+    type(field_t), pointer :: omega_x, omega_y, omega_z, u
+    type(field_t) :: w_sq
+    real(kind=rp) :: vol, mean_wx, mean_wy, mean_wz
+    real(kind=rp) :: mean_w2, var_w
+    type(coef_t), pointer :: coef
+
+    coef => neko_user_access%case%fluid%c_Xh
+
+    u => neko_registry%get_field('u')
+    omega_x => neko_registry%get_field("omega_x")
+    omega_y => neko_registry%get_field("omega_y")
+    omega_z => neko_registry%get_field("omega_z")
+
+    ! Work array for the squared vorticity magnitude
+    call w_sq%init(u%dof, 'w_sq')
+
+    ! Compute |omega|^2 = omega_x^2 + omega_y^2 + omega_z^2 point-wise
+    call field_col3(w_sq, omega_x, omega_x)    ! w_sq = omega_x * omega_x
+    call field_addcol3(w_sq, omega_y, omega_y) ! w_sq = w_sq + omega_y * omega_y
+    call field_addcol3(w_sq, omega_z, omega_z) ! w_sq = w_sq + omega_z * omega_z
+
+    ! Domain volume (using the mass matrix / quadrature weights)
+    vol = coef%volume
+
+    ! Mean of each vorticity component
+    mean_wx = field_glsum(omega_x) / vol
+    mean_wy = field_glsum(omega_y) / vol
+    mean_wz = field_glsum(omega_z) / vol
+
+    ! Mean squared vorticity magnitude
+    mean_w2 = field_glsum(w_sq) / vol
+
+    ! Variance of the vorticity magnitude
+    var_w = mean_w2 - (mean_wx**2 + mean_wy**2 + mean_wz**2)
+
+    if (pe_rank .eq. 0) then
+       write(*,'(a,e18.9,a,e18.9)') &
+            'VARIANCE: t:', time%t, ' var:', var_w
+    end if
+
+    call w_sq%free()
+
+  end subroutine omega_variance
 
   ! User-defined finalization routine called at the end of the simulation
   subroutine user_finalize(time)
