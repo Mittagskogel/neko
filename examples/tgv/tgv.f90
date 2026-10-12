@@ -170,8 +170,10 @@ contains
 
   end subroutine user_calc_quantities
 
-  ! Compute and print the variance of the vorticity magnitude over the domain.
-  ! Variance is defined as <|omega|^2> - |<omega>|^2.
+  ! Compute and print the variance of the vorticity vector over the domain.
+  ! Variance is defined as <|omega|^2> - |<omega>|^2, where the averages are
+  ! taken with the mass-matrix weighted volume average used elsewhere in Neko
+  ! (e.g. for kinetic energy and enstrophy).
   subroutine omega_variance(time)
     type(time_state_t), intent(in) :: time
 
@@ -199,15 +201,21 @@ contains
     ! Domain volume (using the mass matrix / quadrature weights)
     vol = coef%volume
 
-    ! Mean of each vorticity component
-    mean_wx = field_glsum(omega_x) / vol
-    mean_wy = field_glsum(omega_y) / vol
-    mean_wz = field_glsum(omega_z) / vol
+    ! Mass-weighted mean of each vorticity component
+    ! <f> = integral(f) / volume = glsc2(f, B) / volume
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       mean_wx = device_glsc2(omega_x%x_d, coef%B_d, omega_x%size()) / vol
+       mean_wy = device_glsc2(omega_y%x_d, coef%B_d, omega_y%size()) / vol
+       mean_wz = device_glsc2(omega_z%x_d, coef%B_d, omega_z%size()) / vol
+       mean_w2 = device_glsc2(w_sq%x_d, coef%B_d, w_sq%size()) / vol
+    else
+       mean_wx = glsc2(omega_x%x, coef%B, omega_x%size()) / vol
+       mean_wy = glsc2(omega_y%x, coef%B, omega_y%size()) / vol
+       mean_wz = glsc2(omega_z%x, coef%B, omega_z%size()) / vol
+       mean_w2 = glsc2(w_sq%x, coef%B, w_sq%size()) / vol
+    end if
 
-    ! Mean squared vorticity magnitude
-    mean_w2 = field_glsum(w_sq) / vol
-
-    ! Variance of the vorticity magnitude
+    ! Variance of the vorticity vector
     var_w = mean_w2 - (mean_wx**2 + mean_wy**2 + mean_wz**2)
 
     if (pe_rank .eq. 0) then
