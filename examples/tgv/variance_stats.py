@@ -14,14 +14,18 @@ additionally computes the mean magnitude and variance of the vector difference.
 
 Usage
 -----
-Single set of vorticity fields:
+Single set of vorticity fields (default):
     ./vorticity_stats.py vorticity0.nek5000
 
-Velocity from the main fluid output:
-    ./vorticity_stats.py field0.nek5000 --fields u,v,w
+Velocity from the main fluid output using a preset:
+    ./vorticity_stats.py field0.nek5000 --vector velocity
+
+Custom vector components:
+    ./vorticity_stats.py vorticity0.nek5000 --fields omega_x,omega_y,omega_z
 
 Compare two sets:
     ./vorticity_stats.py vorticity0.nek5000 --second other0.nek5000
+
 
 Output
 ------
@@ -33,7 +37,6 @@ A progress bar is written to stderr when stdout is not a terminal; use
 """
 
 import argparse
-import os
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -262,18 +265,18 @@ def _process_single_file(
 
 
 def _process_pair(
-    args: tuple[Path, Path, int, tuple[str, str, str], tuple[str, str, str]]
+    args: tuple[Path, Path, int, tuple[str, str, str]]
 ) -> tuple[int, float, float, float, float, float]:
     """Worker: read a file pair and return stats plus difference stats."""
-    meta_path1, meta_path2, istep, field_names1, field_names2 = args
+    meta_path1, meta_path2, istep, field_names = args
     template1, _, _ = parse_nek5000_meta(meta_path1)
     template2, _, _ = parse_nek5000_meta(meta_path2)
 
     fname1 = build_field_filename(meta_path1, template1, istep)
     fname2 = build_field_filename(meta_path2, template2, istep)
 
-    time1, weights1, c1a, c2a, c3a = read_vector_field(fname1, field_names1)
-    _time2, _weights2, c1b, c2b, c3b = read_vector_field(fname2, field_names2)
+    time1, weights1, c1a, c2a, c3a = read_vector_field(fname1, field_names)
+    _time2, _weights2, c1b, c2b, c3b = read_vector_field(fname2, field_names)
 
     mean, var = vector_variance(weights1, c1a, c2a, c3a)
     mean_diff, var_diff = vector_variance(
@@ -322,6 +325,38 @@ def _parse_fields(field_str: str) -> tuple[str, str, str]:
     return tuple(names)  # type: ignore[return-value]
 
 
+_VECTOR_PRESETS = {
+    "vorticity": ("omega_x", "omega_y", "omega_z"),
+    "velocity": ("u", "v", "w"),
+}
+
+
+def _resolve_fields(
+    vector: str | None, fields: str | None, default_vector: str
+) -> tuple[str, str, str]:
+    """Resolve field names from a vector preset or a custom comma-separated list.
+
+    Exactly one of ``vector`` or ``fields`` must be supplied. The ``vector``
+    preset is expanded to its component names; ``fields`` is parsed directly.
+    """
+    if vector is not None and fields is not None:
+        raise ValueError("Only one of --vector and --fields may be given.")
+
+    if vector is None and fields is None:
+        vector = default_vector
+
+    if vector is not None:
+        preset = vector.lower()
+        if preset not in _VECTOR_PRESETS:
+            raise ValueError(
+                f"Unknown vector preset '{vector}'. "
+                f"Known presets: {', '.join(_VECTOR_PRESETS)}"
+            )
+        return _VECTOR_PRESETS[preset]
+
+    return _parse_fields(fields)
+
+
 def process_single_series(
     meta_path: Path,
     field_names: tuple[str, str, str],
@@ -346,8 +381,7 @@ def process_single_series(
 def process_two_series(
     meta_path1: Path,
     meta_path2: Path,
-    field_names1: tuple[str, str, str],
-    field_names2: tuple[str, str, str],
+    field_names: tuple[str, str, str],
     show_progress: bool,
     n_workers: int,
 ):
@@ -367,7 +401,7 @@ def process_two_series(
 
     print("# time mean_magnitude variance mean_diff variance_diff")
     tasks = [
-        (meta_path1, meta_path2, istep, field_names1, field_names2)
+        (meta_path1, meta_path2, istep, field_names)
         for istep in range(first1, first1 + n1)
     ]
     rows = _run_parallel(
@@ -387,7 +421,7 @@ def main(argv=None):
     parser.add_argument(
         "nek5000",
         type=Path,
-        help="Path to the .nek5000 meta file for the first vorticity series.",
+        help="Path to the .nek5000 meta file for the first field series.",
     )
     parser.add_argument(
         "--second",
@@ -397,20 +431,21 @@ def main(argv=None):
         "When given, the mean and variance of the vector difference are added.",
     )
     parser.add_argument(
-        "--fields",
-        type=str,
-        default="omega_x,omega_y,omega_z",
-        help="Comma-separated list of three vector component names. "
-        "Use velocity component names (u,v,w or ux,uy,uz) to read from the "
-        "velocity slot of the main fluid output; otherwise the first three "
-        "scalar slots are read (default: omega_x,omega_y,omega_z).",
-    )
-    parser.add_argument(
-        "--second-fields",
+        "--vector",
         type=str,
         default=None,
-        help="Comma-separated field names for the second series. "
-        "Defaults to the same names as --fields.",
+        choices=list(_VECTOR_PRESETS),
+        help="Select a vector preset: 'velocity' (u,v,w) or "
+        "'vorticity' (omega_x, omega_y, omega_z).",
+    )
+    parser.add_argument(
+        "--fields",
+        type=str,
+        default=None,
+        help="Comma-separated list of three custom vector component names. "
+        "Use velocity component names (u,v,w or ux,uy,uz) to read from the "
+        "velocity slot of the main fluid output; otherwise the first three "
+        "scalar slots are read. Mutually exclusive with --vector.",
     )
     parser.add_argument(
         "--progress",
@@ -445,12 +480,7 @@ def main(argv=None):
     n_workers = max(1, args.jobs)
 
     try:
-        field_names = _parse_fields(args.fields)
-        field_names2 = (
-            _parse_fields(args.second_fields)
-            if args.second_fields is not None
-            else field_names
-        )
+        field_names = _resolve_fields(args.vector, args.fields, "vorticity")
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
@@ -474,7 +504,6 @@ def main(argv=None):
             args.nek5000,
             args.second,
             field_names,
-            field_names2,
             show_progress,
             n_workers,
         )
