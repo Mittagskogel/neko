@@ -10,27 +10,37 @@ velocity ``(u, v, w)`` from the main fluid output, can be selected with
 ``--fields``.
 
 Optionally, a second field series can be supplied. In that case the script
-additionally computes the mean magnitude and variance of the vector difference.
+additionally computes the mean magnitude/variance of the difference.
 
 Usage
 -----
-Single set of vorticity fields (default):
-    ./vorticity_stats.py vorticity0.nek5000
+Single set of vorticity fields (default vector mode):
+    ./variance_stats.py vorticity0.nek5000
 
 Velocity from the main fluid output using a preset:
-    ./vorticity_stats.py field0.nek5000 --vector velocity
+    ./variance_stats.py field0.nek5000 --vector velocity
 
 Custom vector components:
-    ./vorticity_stats.py vorticity0.nek5000 --fields omega_x,omega_y,omega_z
+    ./variance_stats.py vorticity0.nek5000 --fields omega_x,omega_y,omega_z
+
+Single scalar component (e.g. omega_x):
+    ./variance_stats.py vorticity0.nek5000 --scalar omega_x
 
 Compare two sets:
-    ./vorticity_stats.py vorticity0.nek5000 --second other0.nek5000
+    ./variance_stats.py vorticity0.nek5000 --second other0.nek5000
+
+Compare a scalar component between two sets:
+    ./variance_stats.py vorticity0.nek5000 --scalar omega_x \\
+        --second other0.nek5000
 
 
 Output
 ------
 A space-separated table written to stdout with one line per timestep:
     time mean_magnitude variance [mean_diff variance_diff]
+
+In scalar mode the header is:
+    time mean variance [mean_diff variance_diff]
 
 A progress bar is written to stderr when stdout is not a terminal; use
 ``--progress`` to force it or ``--no-progress`` to disable it.
@@ -154,6 +164,37 @@ def _uses_velocity_storage(field_names: tuple[str, str, str]) -> bool:
     return all(name in velocity_aliases for name in field_names)
 
 
+def _velocity_component_index(name: str) -> int:
+    """Map a velocity component name to its index in ``elem.vel``."""
+    name = name.lower()
+    if name in {"u", "ux", "vx"}:
+        return 0
+    if name in {"v", "uy", "vy"}:
+        return 1
+    if name in {"w", "uz", "vz"}:
+        return 2
+    raise ValueError(f"Unknown velocity component name: {name}")
+
+
+def _scalar_component_index(name: str) -> int:
+    """Map a scalar field name to its best-guess index in ``elem.scal``.
+
+    The Nek5000 file format does not carry scalar names, so this mapping is
+    based on the conventional ordering used by Neko's ``field_writer``.
+    """
+    name = name.lower()
+    if name in {"omega_x", "wx"}:
+        return 0
+    if name in {"omega_y", "wy"}:
+        return 1
+    if name in {"omega_z", "wz"}:
+        return 2
+    raise ValueError(
+        f"Cannot infer scalar index for '{name}'. "
+        "Use --scalar-index to specify it explicitly."
+    )
+
+
 def read_vector_field(
     path: Path, field_names: tuple[str, str, str]
 ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -215,6 +256,72 @@ def read_vector_field(
     return float(data.time), weights, c1, c2, c3
 
 
+def read_scalar_field(
+    path: Path,
+    field_name: str,
+    scalar_index: int | None = None,
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """Read a scalar field file and return the time, weights, and values.
+
+    Parameters
+    ----------
+    path :
+        Path to the Neko field file.
+    field_name :
+        Name of the scalar field. Used to infer the index in ``elem.scal``
+        unless ``scalar_index`` is provided.
+    scalar_index :
+        Optional explicit zero-based index into ``elem.scal``. If given, it
+        overrides the name-based inference.
+
+    Returns
+    -------
+    time :
+        Simulation time stored in the file header.
+    weights :
+        A 3D array of GLL quadrature weights with shape ``(lz, ly, lx)``.
+    values :
+        A stacked 4-D array of shape ``(nelv, lz, ly, lx)``.
+    """
+    data = readnek(str(path))
+
+    lx, ly, lz = data.lr1
+    if lx != ly or ly != lz:
+        raise ValueError(
+            f"Only isotropic polynomial orders are supported, got {data.lr1}"
+        )
+
+    w1d = gll_weights_1d(lx - 1)
+    weights = w1d[None, None, :] * w1d[None, :, None] * w1d[:, None, None]
+
+    if scalar_index is None:
+        scalar_index = _scalar_component_index(field_name)
+
+    n_scalars = data.var[4]
+    if scalar_index >= n_scalars:
+        raise ValueError(
+            f"Scalar index {scalar_index} out of range in {path} "
+            f"(only {n_scalars} scalars available)"
+        )
+
+    scal = np.stack([elem.scal for elem in data.elem], axis=0)
+    values = scal[:, scalar_index, :, :, :]
+
+    return float(data.time), weights, values
+
+
+def _weighted_stats(
+    weights: np.ndarray, values: np.ndarray
+) -> tuple[float, float]:
+    """Return the weighted mean and variance of ``values``."""
+    weights = weights[np.newaxis, :, :, :]
+    norm = float(values.shape[0] * np.sum(weights))
+    mean = float(np.sum(weights * values) / norm)
+    mean_sq = float(np.sum(weights * values**2) / norm)
+    variance = mean_sq - mean**2
+    return mean, variance
+
+
 def vector_variance(
     weights: np.ndarray,
     c1: np.ndarray,
@@ -234,54 +341,80 @@ def vector_variance(
     ``Var[v] = <|v|^2> - |<v>|^2``,
     where ``<|v|^2> = <v1^2 + v2^2 + v3^2>``.
     """
-    weights = weights[np.newaxis, :, :, :]
-    norm = float(c1.shape[0] * np.sum(weights))
-
-    def weighted_mean(values: np.ndarray) -> float:
-        return float(np.sum(weights * values) / norm)
-
-    mean_c1 = weighted_mean(c1)
-    mean_c2 = weighted_mean(c2)
-    mean_c3 = weighted_mean(c3)
+    mean_c1, _ = _weighted_stats(weights, c1)
+    mean_c2, _ = _weighted_stats(weights, c2)
+    mean_c3, _ = _weighted_stats(weights, c3)
 
     mean_magnitude = np.sqrt(mean_c1**2 + mean_c2**2 + mean_c3**2)
 
-    mean_w2 = weighted_mean(c1**2 + c2**2 + c3**2)
+    mean_w2 = float(
+        np.sum(weights[np.newaxis, :, :, :] * (c1**2 + c2**2 + c3**2))
+        / float(c1.shape[0] * np.sum(weights))
+    )
     variance = mean_w2 - mean_magnitude**2
 
     return float(mean_magnitude), float(variance)
 
 
+def scalar_variance(weights: np.ndarray, values: np.ndarray) -> tuple[float, float]:
+    """Return mean and variance of a scalar field."""
+    return _weighted_stats(weights, values)
+
+
 def _process_single_file(
-    args: tuple[Path, int, tuple[str, str, str]]
+    args: tuple[Path, int, tuple[str, str, str] | tuple[str, int | None]]
 ) -> tuple[int, float, float, float]:
     """Worker: read one file and return its timestep, time, mean, and variance."""
-    meta_path, istep, field_names = args
+    meta_path, istep, field_spec = args
     template, first_step, _ = parse_nek5000_meta(meta_path)
     fname = build_field_filename(meta_path, template, istep)
-    time, weights, c1, c2, c3 = read_vector_field(fname, field_names)
-    mean, var = vector_variance(weights, c1, c2, c3)
+
+    if isinstance(field_spec, tuple) and len(field_spec) == 3:
+        # Vector mode
+        field_names = field_spec  # type: ignore[assignment]
+        time, weights, c1, c2, c3 = read_vector_field(fname, field_names)
+        mean, var = vector_variance(weights, c1, c2, c3)
+    else:
+        # Scalar mode
+        field_name, scalar_index = field_spec  # type: ignore[misc]
+        time, weights, values = read_scalar_field(fname, field_name, scalar_index)
+        mean, var = scalar_variance(weights, values)
+
     return istep, time, mean, var
 
 
 def _process_pair(
-    args: tuple[Path, Path, int, tuple[str, str, str]]
+    args: tuple[Path, Path, int, tuple[str, str, str] | tuple[str, int | None]]
 ) -> tuple[int, float, float, float, float, float]:
     """Worker: read a file pair and return stats plus difference stats."""
-    meta_path1, meta_path2, istep, field_names = args
+    meta_path1, meta_path2, istep, field_spec = args
     template1, _, _ = parse_nek5000_meta(meta_path1)
     template2, _, _ = parse_nek5000_meta(meta_path2)
 
     fname1 = build_field_filename(meta_path1, template1, istep)
     fname2 = build_field_filename(meta_path2, template2, istep)
 
-    time1, weights1, c1a, c2a, c3a = read_vector_field(fname1, field_names)
-    _time2, _weights2, c1b, c2b, c3b = read_vector_field(fname2, field_names)
+    if isinstance(field_spec, tuple) and len(field_spec) == 3:
+        # Vector mode
+        field_names = field_spec  # type: ignore[assignment]
+        time1, weights1, c1a, c2a, c3a = read_vector_field(fname1, field_names)
+        _time2, _weights2, c1b, c2b, c3b = read_vector_field(fname2, field_names)
+        mean, var = vector_variance(weights1, c1a, c2a, c3a)
+        mean_diff, var_diff = vector_variance(
+            weights1, c1a - c1b, c2a - c2b, c3a - c3b
+        )
+    else:
+        # Scalar mode
+        field_name, scalar_index = field_spec  # type: ignore[misc]
+        time1, weights1, values_a = read_scalar_field(
+            fname1, field_name, scalar_index
+        )
+        _time2, _weights2, values_b = read_scalar_field(
+            fname2, field_name, scalar_index
+        )
+        mean, var = scalar_variance(weights1, values_a)
+        mean_diff, var_diff = scalar_variance(weights1, values_a - values_b)
 
-    mean, var = vector_variance(weights1, c1a, c2a, c3a)
-    mean_diff, var_diff = vector_variance(
-        weights1, c1a - c1b, c2a - c2b, c3a - c3b
-    )
     return istep, time1, mean, var, mean_diff, var_diff
 
 
@@ -357,18 +490,40 @@ def _resolve_fields(
     return _parse_fields(fields)
 
 
+def _resolve_field_spec(
+    vector: str | None,
+    fields: str | None,
+    scalar: str | None,
+    scalar_index: int | None,
+) -> tuple[str, str, str] | tuple[str, int | None]:
+    """Resolve the field specification for vector or scalar mode."""
+    modes = [vector is not None, fields is not None, scalar is not None]
+    if sum(modes) > 1:
+        raise ValueError(
+            "Only one of --vector, --fields, or --scalar may be given."
+        )
+
+    if scalar is not None:
+        return (scalar, scalar_index)
+
+    return _resolve_fields(vector, fields, "vorticity")
+
+
 def process_single_series(
     meta_path: Path,
-    field_names: tuple[str, str, str],
+    field_spec: tuple[str, str, str] | tuple[str, int | None],
     show_progress: bool,
     n_workers: int,
 ):
-    """Compute and print mean/variance for one vector field series."""
+    """Compute and print mean/variance for one field series."""
     template, first_step, n_steps = parse_nek5000_meta(meta_path)
 
-    print("# time mean_magnitude variance")
+    is_scalar = len(field_spec) == 2
+    header = "# time mean variance" if is_scalar else "# time mean_magnitude variance"
+    print(header)
+
     tasks = [
-        (meta_path, istep, field_names)
+        (meta_path, istep, field_spec)
         for istep in range(first_step, first_step + n_steps)
     ]
     rows = _run_parallel(
@@ -381,7 +536,7 @@ def process_single_series(
 def process_two_series(
     meta_path1: Path,
     meta_path2: Path,
-    field_names: tuple[str, str, str],
+    field_spec: tuple[str, str, str] | tuple[str, int | None],
     show_progress: bool,
     n_workers: int,
 ):
@@ -399,9 +554,15 @@ def process_two_series(
             f"First timestep indices differ: {first1} vs {first2}"
         )
 
-    print("# time mean_magnitude variance mean_diff variance_diff")
+    is_scalar = len(field_spec) == 2
+    header = (
+        "# time mean variance mean_diff variance_diff"
+        if is_scalar
+        else "# time mean_magnitude variance mean_diff variance_diff"
+    )
+    print(header)
     tasks = [
-        (meta_path1, meta_path2, istep, field_names)
+        (meta_path1, meta_path2, istep, field_spec)
         for istep in range(first1, first1 + n1)
     ]
     rows = _run_parallel(
@@ -448,6 +609,22 @@ def main(argv=None):
         "scalar slots are read. Mutually exclusive with --vector.",
     )
     parser.add_argument(
+        "--scalar",
+        type=str,
+        default=None,
+        help="Compute statistics for a single scalar field by name, e.g. "
+        "'omega_x' or 'omega_y'. The name is used to infer the scalar index "
+        "when possible; use --scalar-index to override. Mutually exclusive "
+        "with --vector and --fields.",
+    )
+    parser.add_argument(
+        "--scalar-index",
+        type=int,
+        default=None,
+        help="Zero-based index into elem.scal for --scalar. Overrides the "
+        "name-based inference.",
+    )
+    parser.add_argument(
         "--progress",
         action="store_true",
         default=None,
@@ -480,7 +657,9 @@ def main(argv=None):
     n_workers = max(1, args.jobs)
 
     try:
-        field_names = _resolve_fields(args.vector, args.fields, "vorticity")
+        field_spec = _resolve_field_spec(
+            args.vector, args.fields, args.scalar, args.scalar_index
+        )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
@@ -491,7 +670,7 @@ def main(argv=None):
 
     if args.second is None:
         process_single_series(
-            args.nek5000, field_names, show_progress, n_workers
+            args.nek5000, field_spec, show_progress, n_workers
         )
     else:
         if not args.second.exists():
@@ -503,7 +682,7 @@ def main(argv=None):
         process_two_series(
             args.nek5000,
             args.second,
-            field_names,
+            field_spec,
             show_progress,
             n_workers,
         )
