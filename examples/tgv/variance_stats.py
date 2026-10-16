@@ -158,10 +158,12 @@ def build_field_filename(meta_path: Path, template: str, istep: int) -> Path:
     return base_dir / fname
 
 
-def _uses_velocity_storage(field_names: tuple[str, str, str]) -> bool:
-    """Return True if the requested fields live in pymech's ``elem.vel``."""
-    velocity_aliases = {"u", "v", "w", "ux", "uy", "uz", "vx", "vy", "vz"}
-    return all(name in velocity_aliases for name in field_names)
+_VELOCITY_ALIASES = {"u", "v", "w", "ux", "uy", "uz", "vx", "vy", "vz"}
+
+
+def _uses_velocity_storage(field_names: tuple[str, ...]) -> bool:
+    """Return True if all requested fields live in pymech's ``elem.vel``."""
+    return all(_is_velocity_component(name) for name in field_names)
 
 
 def _velocity_component_index(name: str) -> int:
@@ -193,6 +195,11 @@ def _scalar_component_index(name: str) -> int:
         f"Cannot infer scalar index for '{name}'. "
         "Use --scalar-index to specify it explicitly."
     )
+
+
+def _is_velocity_component(name: str) -> bool:
+    """Return True if ``name`` refers to a component in ``elem.vel``."""
+    return name.lower() in {"u", "v", "w", "ux", "uy", "uz", "vx", "vy", "vz"}
 
 
 def read_vector_field(
@@ -256,6 +263,28 @@ def read_vector_field(
     return float(data.time), weights, c1, c2, c3
 
 
+def inspect_field_file(path: Path) -> None:
+    """Print a summary of the fields stored in a Neko field file.
+
+    The Nek5000 file format does not store variable names, only counts of
+    velocity components, pressure fields, temperature fields, and passive
+    scalar fields. This function prints those counts along with the mesh and
+    timestep metadata.
+    """
+    data = readnek(str(path))
+    lx, ly, lz = data.lr1
+    nelv = len(data.elem)
+
+    print(f"File: {path}")
+    print(f"  Time: {data.time:.9e}")
+    print(f"  Polynomial order (lx, ly, lz): {lx} {ly} {lz}")
+    print(f"  Elements: {nelv}")
+    print(f"  Velocity components: {data.var[1]}")
+    print(f"  Pressure fields: {data.var[2]}")
+    print(f"  Temperature fields: {data.var[3]}")
+    print(f"  Passive scalar fields: {data.var[4]}")
+
+
 def read_scalar_field(
     path: Path,
     field_name: str,
@@ -268,11 +297,13 @@ def read_scalar_field(
     path :
         Path to the Neko field file.
     field_name :
-        Name of the scalar field. Used to infer the index in ``elem.scal``
-        unless ``scalar_index`` is provided.
+        Name of the scalar field. Used to infer the index in ``elem.scal`` or
+        ``elem.vel`` unless ``scalar_index`` is provided. Velocity component
+        names such as ``u``, ``v``, or ``w`` select ``elem.vel``.
     scalar_index :
         Optional explicit zero-based index into ``elem.scal``. If given, it
-        overrides the name-based inference.
+        overrides the name-based inference. This index always refers to scalar
+        storage, even for velocity component names.
 
     Returns
     -------
@@ -294,18 +325,40 @@ def read_scalar_field(
     w1d = gll_weights_1d(lx - 1)
     weights = w1d[None, None, :] * w1d[None, :, None] * w1d[:, None, None]
 
-    if scalar_index is None:
+    if scalar_index is not None:
+        # Explicit scalar index: read from scalar storage regardless of name.
+        n_scalars = data.var[4]
+        if scalar_index >= n_scalars:
+            raise ValueError(
+                f"Scalar index {scalar_index} out of range in {path} "
+                f"(only {n_scalars} scalars available)"
+            )
+        scal = np.stack([elem.scal for elem in data.elem], axis=0)
+        values = scal[:, scalar_index, :, :, :]
+    elif _uses_velocity_storage((field_name,)):
+        # Velocity component name: read from the velocity slot (elem.vel).
+        vel_idx = _velocity_component_index(field_name)
+        n_vel = data.var[1]
+        if n_vel == 0:
+            raise ValueError(f"No velocity components available in {path}")
+        if vel_idx >= n_vel:
+            raise ValueError(
+                f"Velocity component index {vel_idx} out of range in {path} "
+                f"(only {n_vel} components available)"
+            )
+        vel = np.stack([elem.vel for elem in data.elem], axis=0)
+        values = vel[:, vel_idx, :, :, :]
+    else:
+        # Named scalar: infer the index and read from scalar storage (elem.scal).
         scalar_index = _scalar_component_index(field_name)
-
-    n_scalars = data.var[4]
-    if scalar_index >= n_scalars:
-        raise ValueError(
-            f"Scalar index {scalar_index} out of range in {path} "
-            f"(only {n_scalars} scalars available)"
-        )
-
-    scal = np.stack([elem.scal for elem in data.elem], axis=0)
-    values = scal[:, scalar_index, :, :, :]
+        n_scalars = data.var[4]
+        if scalar_index >= n_scalars:
+            raise ValueError(
+                f"Scalar index {scalar_index} out of range in {path} "
+                f"(only {n_scalars} scalars available)"
+            )
+        scal = np.stack([elem.scal for elem in data.elem], axis=0)
+        values = scal[:, scalar_index, :, :, :]
 
     return float(data.time), weights, values
 
@@ -370,12 +423,12 @@ def _process_single_file(
     fname = build_field_filename(meta_path, template, istep)
 
     if isinstance(field_spec, tuple) and len(field_spec) == 3:
-        # Vector mode
+        # Vector mode: three-component field (e.g. vorticity or velocity).
         field_names = field_spec  # type: ignore[assignment]
         time, weights, c1, c2, c3 = read_vector_field(fname, field_names)
         mean, var = vector_variance(weights, c1, c2, c3)
     else:
-        # Scalar mode
+        # Scalar mode: single component (scalar or velocity component).
         field_name, scalar_index = field_spec  # type: ignore[misc]
         time, weights, values = read_scalar_field(fname, field_name, scalar_index)
         mean, var = scalar_variance(weights, values)
@@ -395,7 +448,7 @@ def _process_pair(
     fname2 = build_field_filename(meta_path2, template2, istep)
 
     if isinstance(field_spec, tuple) and len(field_spec) == 3:
-        # Vector mode
+        # Vector mode: three-component field (e.g. vorticity or velocity).
         field_names = field_spec  # type: ignore[assignment]
         time1, weights1, c1a, c2a, c3a = read_vector_field(fname1, field_names)
         _time2, _weights2, c1b, c2b, c3b = read_vector_field(fname2, field_names)
@@ -404,7 +457,7 @@ def _process_pair(
             weights1, c1a - c1b, c2a - c2b, c3a - c3b
         )
     else:
-        # Scalar mode
+        # Scalar mode: single component (scalar or velocity component).
         field_name, scalar_index = field_spec  # type: ignore[misc]
         time1, weights1, values_a = read_scalar_field(
             fname1, field_name, scalar_index
@@ -476,6 +529,7 @@ def _resolve_fields(
         raise ValueError("Only one of --vector and --fields may be given.")
 
     if vector is None and fields is None:
+        # No explicit choice: fall back to the default preset.
         vector = default_vector
 
     if vector is not None:
@@ -504,8 +558,10 @@ def _resolve_field_spec(
         )
 
     if scalar is not None:
+        # Scalar mode: return the component name and optional scalar index.
         return (scalar, scalar_index)
 
+    # Vector mode: resolve to three component names.
     return _resolve_fields(vector, fields, "vorticity")
 
 
@@ -612,17 +668,26 @@ def main(argv=None):
         "--scalar",
         type=str,
         default=None,
-        help="Compute statistics for a single scalar field by name, e.g. "
-        "'omega_x' or 'omega_y'. The name is used to infer the scalar index "
-        "when possible; use --scalar-index to override. Mutually exclusive "
-        "with --vector and --fields.",
+        help="Compute statistics for a single component by name, e.g. "
+        "'omega_x', 'omega_y', 'u', or 'v'. Velocity component names select "
+        "the corresponding slot from elem.vel; other names infer an index in "
+        "elem.scal. Use --scalar-index to override. Mutually exclusive with "
+        "--vector and --fields.",
     )
     parser.add_argument(
         "--scalar-index",
         type=int,
         default=None,
         help="Zero-based index into elem.scal for --scalar. Overrides the "
-        "name-based inference.",
+        "name-based inference and always selects scalar storage, even for "
+        "velocity component names.",
+    )
+    parser.add_argument(
+        "--inspect",
+        action="store_true",
+        help="Print a summary of the fields stored in the first field file "
+        "and exit. Useful for discovering how many passive scalar slots are "
+        "available before selecting --scalar-index.",
     )
     parser.add_argument(
         "--progress",
@@ -656,16 +721,25 @@ def main(argv=None):
 
     n_workers = max(1, args.jobs)
 
+    if not args.nek5000.exists():
+        print(f"Error: meta file not found: {args.nek5000}", file=sys.stderr)
+        return 1
+
+    if args.inspect:
+        template, first_step, _ = parse_nek5000_meta(args.nek5000)
+        fname = build_field_filename(args.nek5000, template, first_step)
+        if not fname.exists():
+            print(f"Error: field file not found: {fname}", file=sys.stderr)
+            return 1
+        inspect_field_file(fname)
+        return 0
+
     try:
         field_spec = _resolve_field_spec(
             args.vector, args.fields, args.scalar, args.scalar_index
         )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
-        return 1
-
-    if not args.nek5000.exists():
-        print(f"Error: meta file not found: {args.nek5000}", file=sys.stderr)
         return 1
 
     if args.second is None:
