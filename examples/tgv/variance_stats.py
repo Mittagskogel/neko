@@ -49,11 +49,29 @@ A progress bar is written to stderr when stdout is not a terminal; use
 import argparse
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
+
+from typing import Any
 
 import numpy as np
 from pymech.neksuite import readnek
 from tqdm import tqdm
+
+
+@dataclass(frozen=True)
+class VectorSpec:
+    """Specification for a three-component vector field."""
+
+    names: tuple[str, str, str]
+
+
+@dataclass(frozen=True)
+class ScalarSpec:
+    """Specification for a single scalar or velocity component."""
+
+    name: str
+    index: int | None = None
 
 
 def gll_weights_1d(order: int) -> np.ndarray:
@@ -160,10 +178,17 @@ def build_field_filename(meta_path: Path, template: str, istep: int) -> Path:
 
 _VELOCITY_ALIASES = {"u", "v", "w", "ux", "uy", "uz", "vx", "vy", "vz"}
 
+# Indices into pymech's ``data.var`` tuple.
+_VAR_NDIM = 0
+_VAR_NVEL = 1
+_VAR_NP = 2
+_VAR_NT = 3
+_VAR_NSCALAR = 4
+
 
 def _uses_velocity_storage(field_names: tuple[str, ...]) -> bool:
     """Return True if all requested fields live in pymech's ``elem.vel``."""
-    return all(_is_velocity_component(name) for name in field_names)
+    return all(name.lower() in _VELOCITY_ALIASES for name in field_names)
 
 
 def _velocity_component_index(name: str) -> int:
@@ -197,9 +222,32 @@ def _scalar_component_index(name: str) -> int:
     )
 
 
-def _is_velocity_component(name: str) -> bool:
-    """Return True if ``name`` refers to a component in ``elem.vel``."""
-    return name.lower() in {"u", "v", "w", "ux", "uy", "uz", "vx", "vy", "vz"}
+def _gll_weights_3d(lx: int, ly: int, lz: int) -> np.ndarray:
+    """Return a 3-D tensor product of GLL quadrature weights."""
+    wx = gll_weights_1d(lx - 1)
+    wy = gll_weights_1d(ly - 1)
+    wz = gll_weights_1d(lz - 1)
+    return wz[:, None, None] * wy[None, :, None] * wx[None, None, :]
+
+
+def _load_file(path: Path) -> tuple[Any, np.ndarray]:
+    """Read a Neko field file and return the raw data plus 3-D GLL weights.
+
+    Raises
+    ------
+    ValueError
+        If the polynomial order is not isotropic.
+    """
+    data = readnek(str(path))
+
+    lx, ly, lz = data.lr1
+    if lx != ly or ly != lz:
+        raise ValueError(
+            f"Only isotropic polynomial orders are supported, got {data.lr1}"
+        )
+
+    weights = _gll_weights_3d(lx, ly, lz)
+    return data, weights
 
 
 def read_vector_field(
@@ -227,19 +275,10 @@ def read_vector_field(
         Stacked 4-D arrays of shape ``(nelv, lz, ly, lx)`` containing the three
         vector components for all elements.
     """
-    data = readnek(str(path))
-
-    lx, ly, lz = data.lr1
-    if lx != ly or ly != lz:
-        raise ValueError(
-            f"Only isotropic polynomial orders are supported, got {data.lr1}"
-        )
-
-    w1d = gll_weights_1d(lx - 1)
-    weights = w1d[None, None, :] * w1d[None, :, None] * w1d[:, None, None]
+    data, weights = _load_file(path)
 
     if _uses_velocity_storage(field_names):
-        n_vel = data.var[1]
+        n_vel = data.var[_VAR_NVEL]
         if n_vel != 3:
             raise ValueError(
                 f"Expected 3 velocity components in {path}, found {n_vel}"
@@ -249,7 +288,7 @@ def read_vector_field(
         c2 = vel[:, 1, :, :, :]
         c3 = vel[:, 2, :, :, :]
     else:
-        n_scalars = data.var[4]
+        n_scalars = data.var[_VAR_NSCALAR]
         if n_scalars < 3:
             raise ValueError(
                 f"Expected at least 3 scalar components in {path}, "
@@ -271,7 +310,7 @@ def inspect_field_file(path: Path) -> None:
     scalar fields. This function prints those counts along with the mesh and
     timestep metadata.
     """
-    data = readnek(str(path))
+    data, _ = _load_file(path)
     lx, ly, lz = data.lr1
     nelv = len(data.elem)
 
@@ -279,10 +318,10 @@ def inspect_field_file(path: Path) -> None:
     print(f"  Time: {data.time:.9e}")
     print(f"  Polynomial order (lx, ly, lz): {lx} {ly} {lz}")
     print(f"  Elements: {nelv}")
-    print(f"  Velocity components: {data.var[1]}")
-    print(f"  Pressure fields: {data.var[2]}")
-    print(f"  Temperature fields: {data.var[3]}")
-    print(f"  Passive scalar fields: {data.var[4]}")
+    print(f"  Velocity components: {data.var[_VAR_NVEL]}")
+    print(f"  Pressure fields: {data.var[_VAR_NP]}")
+    print(f"  Temperature fields: {data.var[_VAR_NT]}")
+    print(f"  Passive scalar fields: {data.var[_VAR_NSCALAR]}")
 
 
 def read_scalar_field(
@@ -314,20 +353,11 @@ def read_scalar_field(
     values :
         A stacked 4-D array of shape ``(nelv, lz, ly, lx)``.
     """
-    data = readnek(str(path))
-
-    lx, ly, lz = data.lr1
-    if lx != ly or ly != lz:
-        raise ValueError(
-            f"Only isotropic polynomial orders are supported, got {data.lr1}"
-        )
-
-    w1d = gll_weights_1d(lx - 1)
-    weights = w1d[None, None, :] * w1d[None, :, None] * w1d[:, None, None]
+    data, weights = _load_file(path)
 
     if scalar_index is not None:
         # Explicit scalar index: read from scalar storage regardless of name.
-        n_scalars = data.var[4]
+        n_scalars = data.var[_VAR_NSCALAR]
         if scalar_index >= n_scalars:
             raise ValueError(
                 f"Scalar index {scalar_index} out of range in {path} "
@@ -338,7 +368,7 @@ def read_scalar_field(
     elif _uses_velocity_storage((field_name,)):
         # Velocity component name: read from the velocity slot (elem.vel).
         vel_idx = _velocity_component_index(field_name)
-        n_vel = data.var[1]
+        n_vel = data.var[_VAR_NVEL]
         if n_vel == 0:
             raise ValueError(f"No velocity components available in {path}")
         if vel_idx >= n_vel:
@@ -351,7 +381,7 @@ def read_scalar_field(
     else:
         # Named scalar: infer the index and read from scalar storage (elem.scal).
         scalar_index = _scalar_component_index(field_name)
-        n_scalars = data.var[4]
+        n_scalars = data.var[_VAR_NSCALAR]
         if scalar_index >= n_scalars:
             raise ValueError(
                 f"Scalar index {scalar_index} out of range in {path} "
@@ -400,10 +430,7 @@ def vector_variance(
 
     mean_magnitude = np.sqrt(mean_c1**2 + mean_c2**2 + mean_c3**2)
 
-    mean_w2 = float(
-        np.sum(weights[np.newaxis, :, :, :] * (c1**2 + c2**2 + c3**2))
-        / float(c1.shape[0] * np.sum(weights))
-    )
+    mean_w2, _ = _weighted_stats(weights, c1**2 + c2**2 + c3**2)
     variance = mean_w2 - mean_magnitude**2
 
     return float(mean_magnitude), float(variance)
@@ -415,29 +442,29 @@ def scalar_variance(weights: np.ndarray, values: np.ndarray) -> tuple[float, flo
 
 
 def _process_single_file(
-    args: tuple[Path, int, tuple[str, str, str] | tuple[str, int | None]]
+    args: tuple[Path, int, VectorSpec | ScalarSpec]
 ) -> tuple[int, float, float, float]:
     """Worker: read one file and return its timestep, time, mean, and variance."""
     meta_path, istep, field_spec = args
     template, first_step, _ = parse_nek5000_meta(meta_path)
     fname = build_field_filename(meta_path, template, istep)
 
-    if isinstance(field_spec, tuple) and len(field_spec) == 3:
+    if isinstance(field_spec, VectorSpec):
         # Vector mode: three-component field (e.g. vorticity or velocity).
-        field_names = field_spec  # type: ignore[assignment]
-        time, weights, c1, c2, c3 = read_vector_field(fname, field_names)
+        time, weights, c1, c2, c3 = read_vector_field(fname, field_spec.names)
         mean, var = vector_variance(weights, c1, c2, c3)
     else:
         # Scalar mode: single component (scalar or velocity component).
-        field_name, scalar_index = field_spec  # type: ignore[misc]
-        time, weights, values = read_scalar_field(fname, field_name, scalar_index)
+        time, weights, values = read_scalar_field(
+            fname, field_spec.name, field_spec.index
+        )
         mean, var = scalar_variance(weights, values)
 
     return istep, time, mean, var
 
 
 def _process_pair(
-    args: tuple[Path, Path, int, tuple[str, str, str] | tuple[str, int | None]]
+    args: tuple[Path, Path, int, VectorSpec | ScalarSpec]
 ) -> tuple[int, float, float, float, float, float]:
     """Worker: read a file pair and return stats plus difference stats."""
     meta_path1, meta_path2, istep, field_spec = args
@@ -447,23 +474,21 @@ def _process_pair(
     fname1 = build_field_filename(meta_path1, template1, istep)
     fname2 = build_field_filename(meta_path2, template2, istep)
 
-    if isinstance(field_spec, tuple) and len(field_spec) == 3:
+    if isinstance(field_spec, VectorSpec):
         # Vector mode: three-component field (e.g. vorticity or velocity).
-        field_names = field_spec  # type: ignore[assignment]
-        time1, weights1, c1a, c2a, c3a = read_vector_field(fname1, field_names)
-        _time2, _weights2, c1b, c2b, c3b = read_vector_field(fname2, field_names)
+        time1, weights1, c1a, c2a, c3a = read_vector_field(fname1, field_spec.names)
+        _time2, _weights2, c1b, c2b, c3b = read_vector_field(fname2, field_spec.names)
         mean, var = vector_variance(weights1, c1a, c2a, c3a)
         mean_diff, var_diff = vector_variance(
             weights1, c1a - c1b, c2a - c2b, c3a - c3b
         )
     else:
         # Scalar mode: single component (scalar or velocity component).
-        field_name, scalar_index = field_spec  # type: ignore[misc]
         time1, weights1, values_a = read_scalar_field(
-            fname1, field_name, scalar_index
+            fname1, field_spec.name, field_spec.index
         )
         _time2, _weights2, values_b = read_scalar_field(
-            fname2, field_name, scalar_index
+            fname2, field_spec.name, field_spec.index
         )
         mean, var = scalar_variance(weights1, values_a)
         mean_diff, var_diff = scalar_variance(weights1, values_a - values_b)
@@ -549,7 +574,7 @@ def _resolve_field_spec(
     fields: str | None,
     scalar: str | None,
     scalar_index: int | None,
-) -> tuple[str, str, str] | tuple[str, int | None]:
+) -> VectorSpec | ScalarSpec:
     """Resolve the field specification for vector or scalar mode."""
     modes = [vector is not None, fields is not None, scalar is not None]
     if sum(modes) > 1:
@@ -559,22 +584,22 @@ def _resolve_field_spec(
 
     if scalar is not None:
         # Scalar mode: return the component name and optional scalar index.
-        return (scalar, scalar_index)
+        return ScalarSpec(scalar, scalar_index)
 
     # Vector mode: resolve to three component names.
-    return _resolve_fields(vector, fields, "vorticity")
+    return VectorSpec(_resolve_fields(vector, fields, "vorticity"))
 
 
 def process_single_series(
     meta_path: Path,
-    field_spec: tuple[str, str, str] | tuple[str, int | None],
+    field_spec: VectorSpec | ScalarSpec,
     show_progress: bool,
     n_workers: int,
 ):
     """Compute and print mean/variance for one field series."""
     template, first_step, n_steps = parse_nek5000_meta(meta_path)
 
-    is_scalar = len(field_spec) == 2
+    is_scalar = isinstance(field_spec, ScalarSpec)
     header = "# time mean variance" if is_scalar else "# time mean_magnitude variance"
     print(header)
 
@@ -592,7 +617,7 @@ def process_single_series(
 def process_two_series(
     meta_path1: Path,
     meta_path2: Path,
-    field_spec: tuple[str, str, str] | tuple[str, int | None],
+    field_spec: VectorSpec | ScalarSpec,
     show_progress: bool,
     n_workers: int,
 ):
@@ -610,7 +635,7 @@ def process_two_series(
             f"First timestep indices differ: {first1} vs {first2}"
         )
 
-    is_scalar = len(field_spec) == 2
+    is_scalar = isinstance(field_spec, ScalarSpec)
     header = (
         "# time mean variance mean_diff variance_diff"
         if is_scalar
@@ -633,7 +658,7 @@ def process_two_series(
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Compute vorticity statistics from Neko field files."
+        description="Compute spatial mean and variance of Neko field files."
     )
     parser.add_argument(
         "nek5000",
